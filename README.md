@@ -239,7 +239,7 @@ Tuned for local workstations and developer laptops:
 ### 1. Prerequisites & Environment Setup
 Clone the repository and install dependencies:
 ```bash
-git clone https://github.com/aryarakshit/soc-ai-triage-audit.git
+git clone https://github.com/aryarakshit/SOC-AI-Triage-Audit-.git
 cd soc-ai-triage-audit
 
 # Create and activate virtual environment
