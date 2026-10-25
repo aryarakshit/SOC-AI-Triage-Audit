@@ -134,6 +134,25 @@ def test_high_severity_downgrade(guardrail: HITLGuardrail):
     assert any("HIGH_SEVERITY_DOWNGRADE" in r for r in reasons)
 
 
+def test_failed_model_output_always_requires_signoff(guardrail: HITLGuardrail):
+    """A case with no valid model answer is never eligible for auto-closure."""
+    telemetry = CaseTelemetry(
+        case_id=7,
+        category="powershell_execution",
+        rule_id="wazuh_rule_low",
+        rule_level=3,
+        host="WIN-WRK",
+        commandLine="powershell.exe Get-Date",
+        parentImage="explorer.exe",
+        image="powershell.exe",
+        user="jdoe",
+        srcip="10.0.0.1"
+    )
+    requires_human, reasons = guardrail.evaluate_failed_output(telemetry, "Ollama request failed: timeout")
+    assert requires_human is True
+    assert reasons[0].startswith("INVALID_MODEL_OUTPUT")
+
+
 def test_low_confidence_gate(guardrail: HITLGuardrail):
     """Verify confidence below 0.85 requires human sign-off."""
     telemetry = CaseTelemetry(

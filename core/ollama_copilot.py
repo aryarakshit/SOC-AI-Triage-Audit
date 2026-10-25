@@ -1,15 +1,29 @@
-"""Local Ollama Triage Copilot client and calibrated offline benchmark emulator."""
+"""Local Ollama Triage Copilot client and scripted offline emulator."""
 from __future__ import annotations
 import json
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import requests
+from pydantic import ValidationError
 
 from core.schemas import CaseTelemetry, TriageTicketOutput
 
 
+class OllamaUnavailableError(RuntimeError):
+    """Live mode was requested but Ollama or the configured model is not available."""
+
+
+class InvalidModelOutput(Exception):
+    """The model timed out or answered with something that is not a valid ticket."""
+
+    def __init__(self, message: str, latency_ms: float, raw_output: str = ""):
+        super().__init__(message)
+        self.latency_ms = latency_ms
+        self.raw_output = raw_output
+
+
 class OllamaCopilot:
-    """Triage copilot interfacing with local Ollama or calibrated offline emulator."""
+    """Triage copilot backed by a local Ollama model, or a scripted emulator for pipeline tests."""
 
     def __init__(
         self,
@@ -20,6 +34,7 @@ class OllamaCopilot:
         num_ctx: int = 2048,
         num_predict: int = 350,
         timeout_seconds: int = 30,
+        keep_alive: str = "5m",
         mode: str = "auto"  # "auto", "live", "emulation"
     ):
         self.base_url = base_url.rstrip("/")
@@ -29,10 +44,16 @@ class OllamaCopilot:
         self.num_ctx = num_ctx
         self.num_predict = num_predict
         self.timeout_seconds = timeout_seconds
+        self.keep_alive = keep_alive
         self.mode = mode
+        self.active_model: Optional[str] = None
+        self.status_detail = ""
         self._cached_ollama_online: Optional[bool] = None
+        self._available_models: List[str] = []
 
-        # Calibration map for 100 cases modeled after empirical 7B Q4 LLM failure behavior
+        # Scripted answers for emulation mode ONLY: hand-written wrong answers for 21 case
+        # IDs, while every other case returns its ground-truth label. This exercises the
+        # audit pipeline end to end without a model; it says nothing about any LLM.
         self._emulated_failures: Dict[int, Dict[str, Any]] = {
             # LOLBin Signed-Binary Bias traps: Small LLM trusts Microsoft signed binaries in System32
             21: {
@@ -200,26 +221,81 @@ class OllamaCopilot:
             resp = requests.get(f"{self.base_url}/api/tags", timeout=1.0)
             if resp.status_code == 200:
                 self._cached_ollama_online = True
-                models = [m.get("name") for m in resp.json().get("models", [])]
-                return True, f"Ollama online. Available models: {models}"
+                self._available_models = [m.get("name") for m in resp.json().get("models", [])]
+                return True, f"Ollama online. Available models: {self._available_models}"
             self._cached_ollama_online = False
             return False, f"Ollama returned HTTP status {resp.status_code}"
         except Exception as e:
             self._cached_ollama_online = False
             return False, f"Ollama not reachable at {self.base_url}: {e}"
 
+    def _pick_model(self) -> Optional[str]:
+        """Return the primary model if pulled, else the fallback, else None."""
+        for name in (self.model_name, self.fallback_model):
+            if name and (name in self._available_models or f"{name}:latest" in self._available_models):
+                return name
+        return None
+
+    def resolve_mode(self) -> str:
+        """
+        Fix the execution mode for the whole run ("live" or "emulation") and pick one model.
+        A run never mixes modes or models: auto mode only uses the emulator when Ollama or
+        both models are unavailable before the first case.
+        """
+        if self.mode == "emulation":
+            self.status_detail = "Emulation requested explicitly."
+            return "emulation"
+
+        online, detail = self.check_ollama_status()
+        self.active_model = self._pick_model() if online else None
+        if online and self.active_model is None:
+            detail = (
+                f"Ollama is running but neither {self.model_name} nor {self.fallback_model} "
+                f"is pulled. Run `ollama pull {self.model_name}`."
+            )
+        self.status_detail = detail
+
+        if self.active_model:
+            self.mode = "live"
+            return "live"
+        if self.mode == "live":
+            raise OllamaUnavailableError(
+                f"{detail} Start Ollama with `ollama serve`, or use --mode emulation for a pipeline test."
+            )
+        self.mode = "emulation"
+        return "emulation"
+
+    def warm_up(self) -> float:
+        """Load the model into memory so first-case latency isn't inflated by loading time."""
+        start_time = time.perf_counter()
+        requests.post(
+            f"{self.base_url}/api/chat",
+            json={
+                "model": self.active_model or self.model_name,
+                "messages": [{"role": "user", "content": "Reply with OK."}],
+                "stream": False,
+                "keep_alive": self.keep_alive,
+                "options": {"num_predict": 1},
+            },
+            timeout=max(120, self.timeout_seconds),
+        ).raise_for_status()
+        return (time.perf_counter() - start_time) * 1000.0
+
     def build_prompt(self, telemetry: CaseTelemetry) -> str:
-        """Construct structured user prompt containing only raw telemetry."""
+        """
+        Construct the user prompt from behavioral telemetry only.
+
+        Category, rule_id and rule_level are withheld on purpose: in this dataset they were
+        derived from the ground-truth label (descriptive rule IDs such as
+        'sysmon_1_injection_mimikatz', and rule levels 10-14 only on malicious cases), so
+        sending them would let a model copy the answer instead of reading the event.
+        """
         data = {
-            "case_id": telemetry.case_id,
-            "category": telemetry.category,
-            "rule_id": telemetry.rule_id,
-            "rule_level": telemetry.rule_level,
             "host": telemetry.host,
-            "commandLine": telemetry.commandLine,
-            "parentImage": telemetry.parentImage,
-            "image": telemetry.image,
             "user": telemetry.user,
+            "image": telemetry.image,
+            "parentImage": telemetry.parentImage,
+            "commandLine": telemetry.commandLine,
             "srcip": telemetry.srcip
         }
         return (
@@ -231,19 +307,20 @@ class OllamaCopilot:
     def _query_live_ollama(
         self,
         system_prompt: str,
-        user_prompt: str,
-        schema: Dict[str, Any]
+        user_prompt: str
     ) -> Tuple[TriageTicketOutput, float]:
-        """Send inference request to local Ollama REST endpoint."""
+        """Send one inference request to the local Ollama REST endpoint."""
         start_time = time.perf_counter()
         payload = {
-            "model": self.model_name,
+            "model": self.active_model or self.model_name,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            "format": "json",
+            # Structured outputs: Ollama constrains decoding to the ticket JSON schema
+            "format": TriageTicketOutput.model_json_schema(),
             "stream": False,
+            "keep_alive": self.keep_alive,
             "options": {
                 "temperature": self.temperature,
                 "num_ctx": self.num_ctx,
@@ -258,34 +335,31 @@ class OllamaCopilot:
                 timeout=self.timeout_seconds
             )
             resp.raise_for_status()
-            elapsed_ms = (time.perf_counter() - start_time) * 1000.0
             content = resp.json()["message"]["content"]
-            ticket = TriageTicketOutput.model_validate_json(content)
-            return ticket, elapsed_ms
-        except requests.exceptions.RequestException as e:
-            # Fallback to secondary model if primary model fails
-            if self.fallback_model and payload["model"] != self.fallback_model:
-                payload["model"] = self.fallback_model
-                resp = requests.post(
-                    f"{self.base_url}/api/chat",
-                    json=payload,
-                    timeout=self.timeout_seconds
-                )
-                resp.raise_for_status()
-                elapsed_ms = (time.perf_counter() - start_time) * 1000.0
-                content = resp.json()["message"]["content"]
-                return TriageTicketOutput.model_validate_json(content), elapsed_ms
-            raise RuntimeError(f"Ollama live query failed: {e}") from e
+        except (requests.exceptions.RequestException, KeyError, ValueError) as e:
+            elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+            raise InvalidModelOutput(f"Ollama request failed: {e}", elapsed_ms) from e
+
+        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+        try:
+            return TriageTicketOutput.model_validate_json(content), elapsed_ms
+        except ValidationError as e:
+            first_error = e.errors()[0]
+            raise InvalidModelOutput(
+                f"Output failed schema validation at {first_error['loc']}: {first_error['msg']}",
+                elapsed_ms,
+                raw_output=content
+            ) from e
 
     def _emulate_inference(
         self,
         telemetry: CaseTelemetry,
         ground_truth: Dict[str, Any]
     ) -> Tuple[TriageTicketOutput, float]:
-        """Calibrated offline emulator modeling 7B Q4 LLM triage distributions."""
+        """Scripted emulator: replays hand-written answers, otherwise echoes the ground truth."""
         case_id = telemetry.case_id
 
-        # Deterministic simulation latency (180ms - 320ms based on command length)
+        # Made-up latency (180-320 ms from command length); not a measurement
         sim_latency = 180.0 + (len(telemetry.commandLine) % 140)
 
         # Check if this case is in the calibrated failure distribution
@@ -344,35 +418,19 @@ class OllamaCopilot:
         ground_truth: Optional[Dict[str, Any]] = None
     ) -> Tuple[TriageTicketOutput, float, str]:
         """
-        Execute triage on a single case using live Ollama or calibrated emulator.
+        Execute triage on a single case using live Ollama or the scripted emulator.
         Returns: (ticket, latency_ms, execution_mode)
+        Raises InvalidModelOutput in live mode instead of substituting an emulated answer.
         """
-        user_prompt = self.build_prompt(telemetry)
+        if self.mode == "auto":
+            self.resolve_mode()
 
         if self.mode == "live":
-            ticket, latency = self._query_live_ollama(
-                system_prompt, user_prompt, TriageTicketOutput.model_json_schema()
-            )
+            user_prompt = self.build_prompt(telemetry)
+            ticket, latency = self._query_live_ollama(system_prompt, user_prompt)
             return ticket, latency, "live_ollama"
 
-        if self.mode == "emulation":
-            if ground_truth is None:
-                raise ValueError("Ground truth required for calibrated offline benchmark emulation mode.")
-            ticket, latency = self._emulate_inference(telemetry, ground_truth)
-            return ticket, latency, "calibrated_emulator"
-
-        # Auto mode: attempt live Ollama, fall back to calibrated emulator
-        online, _ = self.check_ollama_status()
-        if online:
-            try:
-                ticket, latency = self._query_live_ollama(
-                    system_prompt, user_prompt, TriageTicketOutput.model_json_schema()
-                )
-                return ticket, latency, "live_ollama"
-            except Exception:
-                pass
-
         if ground_truth is None:
-            raise RuntimeError("Ollama offline and no ground truth provided for emulator.")
+            raise ValueError("Ground truth required for the scripted emulation mode.")
         ticket, latency = self._emulate_inference(telemetry, ground_truth)
-        return ticket, latency, "calibrated_emulator"
+        return ticket, latency, "scripted_emulator"

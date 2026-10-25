@@ -22,13 +22,17 @@ Empirical transparency and data privacy over AI hype: rigorously evaluating wher
 - [x] GSD framework initialized.
 
 ### Active
-- [ ] Phase 1: Workspace setup, config (`config/copilot_config.yaml`), `requirements.txt`.
-- [ ] Phase 2: 100-Case HomeSOC Ground-Truth SQLite Database (`core/case_db_builder.py`, `data/homesoc_cases.db`).
-- [ ] Phase 3: Pydantic schemas & Dual-Mode Local Ollama Copilot (`core/schemas.py`, `core/ollama_copilot.py`).
-- [ ] Phase 4: Accuracy Audit Engine & Failure Taxonomy Classifier (`core/audit_engine.py`).
-- [ ] Phase 5: Human-in-the-Loop (HITL) Guardrail & Unit Tests (`core/hitl_guardrail.py`, `tests/`).
-- [ ] Phase 6: Master Audit Runner & Report Generation (`run_copilot_audit.py`, `reports/ai_triage_audit_report.md`).
-- [ ] Phase 7: Professional GitHub README and publication preparation (`README.md`, badges, architecture, setup instructions, security disclosures, MIT license).
+- [ ] Phase 8: Comparative Multi-Model Evaluation (Llama 3.2 3B vs Qwen 2.5 7B) & Real-time SIEM Stream Ingestion.
+
+### Completed
+- [x] Phase 1: Workspace setup, config (`config/copilot_config.yaml`), `requirements.txt`.
+- [x] Phase 2: 100-Case HomeSOC Ground-Truth SQLite Database (`core/case_db_builder.py`, `data/homesoc_cases.db`).
+- [x] Phase 3: Pydantic schemas & Dual-Mode Local Ollama Copilot (`core/schemas.py`, `core/ollama_copilot.py`).
+- [x] Phase 4: Accuracy Audit Engine & Failure Taxonomy Classifier (`core/audit_engine.py`).
+- [x] Phase 5: Human-in-the-Loop (HITL) Guardrail & Unit Tests (`core/hitl_guardrail.py`, `tests/` - 26 tests passing).
+- [x] Phase 6: Master Audit Runner & Report Generation (`run_copilot_audit.py`, `reports/ai_triage_audit_report.md`).
+- [x] Phase 7: Professional GitHub README and publication preparation (`README.md`, badges, architecture, setup instructions, security disclosures, MIT license).
+- [x] Milestone Live: Live local Ollama inference on NVIDIA RTX 4060 CUDA (`qwen2.5:7b-instruct-q4_K_M`) and empirical validation.
 
 ### Out of Scope
 - Cloud LLM API calls (OpenAI, Anthropic) - strictly prohibited to preserve SOC data privacy.

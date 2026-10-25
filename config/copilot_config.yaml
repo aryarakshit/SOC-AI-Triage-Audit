@@ -43,6 +43,7 @@ hitl_policy_gate:
     - "lolbin_abuse"
     - "credential_access"
     - "adversarial_log_injection"
+    - "linux_privilege_escalation"
 
 prompt_templates:
   system_prompt: |

@@ -1,11 +1,10 @@
-"""Master Audit Runner & Portfolio Case Study Generator for Local-LLM SOC Copilot."""
+"""Master Audit Runner & Report Generator for Local-LLM SOC Copilot."""
 from __future__ import annotations
 import argparse
-import os
 import sys
 import time
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Optional, Tuple
 
 # Ensure UTF-8 output encoding for Windows consoles
 if hasattr(sys.stdout, "reconfigure"):
@@ -13,16 +12,23 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+import requests
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from rich.text import Text
 
 from config import load_config, CONFIG_PATH
 from core.case_db_builder import seed_database, DEFAULT_DB_PATH
 from core.schemas import CaseTelemetry, EvaluationResult
-from core.ollama_copilot import OllamaCopilot
-from core.audit_engine import AuditEngine, classify_failure_mode, VERDICT_CLASSES
+from core.ollama_copilot import InvalidModelOutput, OllamaCopilot, OllamaUnavailableError
+from core.audit_engine import (
+    INVALID_OUTPUT,
+    VERDICT_CLASSES,
+    AuditEngine,
+    classify_failure_mode,
+    ranges_overlap,
+    rule_level_ranges,
+)
 from core.hitl_guardrail import HITLGuardrail
 
 DEFAULT_REPORT_PATH = Path(__file__).resolve().parent / "reports" / "ai_triage_audit_report.md"
@@ -30,17 +36,31 @@ DEFAULT_REPORT_PATH = Path(__file__).resolve().parent / "reports" / "ai_triage_a
 console = Console()
 
 
+def describe_kappa(kappa: float) -> str:
+    """Landis & Koch (1977) agreement band for a Cohen's kappa value."""
+    if kappa < 0.0:
+        return "Poor (worse than chance)"
+    for upper, label in ((0.20, "Slight"), (0.40, "Fair"), (0.60, "Moderate"), (0.80, "Substantial")):
+        if kappa <= upper:
+            return f"{label} agreement"
+    return "Almost perfect agreement"
+
+
 def render_markdown_report(
     metrics,
     results: List[EvaluationResult],
     config: dict,
     report_path: Path,
-    execution_mode: str
+    execution_mode: str,
+    model_name: Optional[str],
+    level_ranges: Dict[str, Tuple[int, int]]
 ) -> None:
-    """Generate professional, comprehensive Markdown audit case study."""
+    """Generate the Markdown audit report, stating plainly whether a model was measured."""
     report_path.parent.mkdir(parents=True, exist_ok=True)
+    simulated = execution_mode != "live_ollama"
 
     cm = metrics.confusion_matrix
+    columns = list(next(iter(cm.values())).keys())
     missed_tps = [
         r for r in results
         if r.analyst_verdict == "TP_MALICIOUS" and r.ai_verdict != "TP_MALICIOUS"
@@ -49,60 +69,81 @@ def render_markdown_report(
         r for r in results
         if r.analyst_verdict != "TP_MALICIOUS" and r.ai_verdict == "TP_MALICIOUS"
     ]
-    mitre_hallucinations = [
+    mitre_problems = [
         r for r in results
-        if r.failure_mode == "MITRE_HALLUCINATION"
+        if r.failure_mode in ("MITRE_HALLUCINATION", "MITRE_MISMATCH")
     ]
+    invalid = [r for r in results if r.ai_verdict == INVALID_OUTPUT]
+    latency_note = "Made-up value from the emulator, not a measurement." if simulated else (
+        "Measured per request after a warm-up call (model load excluded)."
+    )
 
     md = []
-    md.append("# Empirical Accuracy Audit & Failure Study: Local-LLM SOC Triage Copilot")
+    md.append("# Accuracy Audit: Local-LLM SOC Triage Copilot")
     md.append("")
-    md.append("> **Evaluation Scope:** $N = 100$ analyst-verified HomeSOC alerts across 6 threat categories.")
-    md.append(f"> **Execution Mode:** `{execution_mode}` | **Quantization & Hardware Target:** 4-bit Q4_K_M (16 GB RAM Profile, `num_ctx: 2048`, `temp: 0.0`)")
+    md.append(f"> **Execution Mode:** `{execution_mode}` | **Model:** `{model_name or 'none (scripted emulator)'}` | `num_ctx: 2048`, `temp: 0.0`")
+    md.append(f"> **Cases:** $N = {metrics.total_cases}$ synthetic lab alerts across 6 threat categories, with ground-truth labels written into `core/case_db_builder.py`.")
     md.append(f"> **Report Generated:** {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}")
     md.append("")
+    if simulated:
+        md.append("> [!WARNING]")
+        md.append("> **Simulated run — not a model result.** The emulator returns hand-written wrong answers for 21 cases "
+                  "and copies the ground-truth label for every other case. These numbers only show that the audit "
+                  "pipeline works. To measure a real model: install Ollama, `ollama pull qwen2.5:7b-instruct-q4_K_M`, "
+                  "then `python run_copilot_audit.py --mode live`.")
+        md.append("")
     md.append("---")
     md.append("")
 
-    # Resume bullet callout
-    md.append("## 1. Executive Summary & Resume Impact")
+    # Summary
+    md.append("## 1. Summary")
     md.append("")
-    md.append("> [!TIP]")
+    subject = "The scripted emulator" if simulated else f"`{model_name}`"
+    lock_note = (
+        f" ({metrics.missed_tp_caught_only_by_category_lock} of them only because of the blanket category lock)"
+        if metrics.missed_true_positives else ""
+    )
     md.append(
-        f"> **Portfolio Bullet Point:**\n"
-        f"> *Architected and audited a privacy-preserving Local-LLM SOC Triage Copilot (Ollama/Qwen2.5-7B) optimized for 16 GB RAM with zero external cloud telemetry egress; benchmarked against $N = {metrics.total_cases}$ analyst-verified HomeSOC alerts achieving {metrics.agreement_rate}% overall agreement (Cohen's $\\kappa = {metrics.cohens_kappa}$) while uncovering {metrics.missed_true_positives} Missed True Positives caused by LOLBin signed-binary bias and adversarial prompt injections; enforced a deterministic Human-in-the-Loop (HITL) Policy Gate that intercepted {metrics.hitl_coverage_rate}% of critical failure modes before automated ticket closure.*"
+        f"{subject} agreed with the ground truth on **{metrics.agreement_rate}%** of {metrics.total_cases} cases "
+        f"(Cohen's $\\kappa = {metrics.cohens_kappa}$, {describe_kappa(metrics.cohens_kappa).lower()}). "
+        f"It missed **{metrics.missed_true_positives} of {metrics.total_true_positives}** malicious cases; the HITL gate "
+        f"sent **{metrics.missed_tp_intercepted}** of those to a human{lock_note}."
+        + (" Because the emulator is scripted, these values were chosen in advance." if simulated else "")
     )
     md.append("")
-    md.append("### Key Performance Indicators")
+    md.append("### Key Metrics")
     md.append("")
-    md.append("| Benchmark Metric | Value | Operational Implication |")
+    md.append("| Benchmark Metric | Value | Note |")
     md.append("| :--- | :--- | :--- |")
-    md.append(f"| **Overall Agreement Rate ($A$)** | **`{metrics.agreement_rate}%`** | Baseline alignment across all 3 verdict classes. |")
-    md.append(f"| **Cohen's Kappa ($\\kappa$)** | **`{metrics.cohens_kappa}`** | Substantial inter-rater reliability corrected for chance. |")
-    md.append(f"| **Total Attack Cases ($TP$)** | `{metrics.total_true_positives}` | Ground-truth malicious security incidents. |")
-    md.append(f"| **Missed True Positives ($Y_{{FN}}$)** | **`{metrics.missed_true_positives}`** | Critical threats downgraded to Benign or Noise by the AI. |")
-    md.append(f"| **True Positive Recall ($\\text{{Recall}}_{{TP}}$)** | **`{metrics.tp_recall}%`** | Sensitivity of AI model to actual malicious behavior. |")
-    md.append(f"| **MITRE Hallucination Rate ($H_{{MITRE}}$)** | **`{metrics.mitre_hallucination_rate}%`** | True Positives where LLM generated invalid/mismatched T-codes. |")
-    md.append(f"| **HITL Guardrail Interception Rate** | **`{metrics.hitl_coverage_rate}%`** | **100% of Missed TPs blocked from automated ticket closure.** |")
-    md.append(f"| **Average Inference Latency** | `{metrics.average_latency_ms} ms` | Real-time Tier-1 assistant performance on commodity hardware. |")
+    md.append(f"| **Overall Agreement Rate ($A$)** | **`{metrics.agreement_rate}%`** | All 3 verdict classes; invalid outputs count as wrong. |")
+    md.append(f"| **Cohen's Kappa ($\\kappa$)** | **`{metrics.cohens_kappa}`** | {describe_kappa(metrics.cohens_kappa)} (Landis & Koch). |")
+    md.append(f"| **Malicious Cases ($TP$)** | `{metrics.total_true_positives}` | Ground-truth attacks in the dataset. |")
+    md.append(f"| **Missed True Positives ($Y_{{FN}}$)** | **`{metrics.missed_true_positives}`** | Attacks labeled benign/noise or left without a valid answer. |")
+    md.append(f"| **True Positive Recall ($\\text{{Recall}}_{{TP}}$)** | **`{metrics.tp_recall}%`** | Share of attacks the copilot flagged. |")
+    md.append(f"| **MITRE Hallucination Rate** | `{metrics.mitre_hallucination_rate}%` | Flagged attacks whose technique ID is not in the benchmark's reference list. |")
+    md.append(f"| **MITRE Mismatch Rate** | `{metrics.mitre_mismatch_rate}%` | Flagged attacks mapped to a real but different technique. |")
+    md.append(f"| **Invalid Model Outputs** | `{metrics.invalid_outputs}` | Timeouts or answers that failed the ticket schema. |")
+    md.append(f"| **HITL Interception of Missed TPs** | **`{metrics.missed_tp_intercepted} / {metrics.missed_true_positives}`** (`{metrics.hitl_coverage_rate}%`) | Missed attacks routed to a human instead of auto-closed. |")
+    md.append(f"| **Caught Only by Category Lock** | `{metrics.missed_tp_caught_only_by_category_lock}` | Missed attacks no other gate (injection scan, severity, confidence) would have stopped. |")
+    md.append(f"| **Average Inference Latency** | `{metrics.average_latency_ms} ms` | {latency_note} |")
     md.append("")
     md.append("---")
     md.append("")
 
     # Multi-class Confusion Matrix
-    md.append("## 2. Multi-Class Confusion Matrix ($3 \\times 3$)")
+    md.append("## 2. Confusion Matrix")
     md.append("")
-    md.append("Rows denote **Human Analyst Ground Truth**; Columns denote **Local LLM Predictions**.")
+    md.append("Rows denote **Ground Truth**; Columns denote **Copilot Predictions**.")
     md.append("")
-    md.append("| Ground Truth \\ AI Prediction | Predicted TP_MALICIOUS | Predicted BP_BENIGN_ADMIN | Predicted FP_NOISE | Row Total |")
-    md.append("| :--- | :---: | :---: | :---: | :---: |")
+    header = " | ".join(f"Predicted {c}" for c in columns)
+    md.append(f"| Ground Truth \\ AI Prediction | {header} | Row Total |")
+    md.append("| :--- | " + " | ".join(":---:" for _ in columns) + " | :---: |")
     for cls in VERDICT_CLASSES:
         row_total = sum(cm[cls].values())
-        md.append(
-            f"| **{cls}** | {cm[cls]['TP_MALICIOUS']} | {cm[cls]['BP_BENIGN_ADMIN']} | {cm[cls]['FP_NOISE']} | **{row_total}** |"
-        )
-    col_totals = [sum(cm[r][c] for r in VERDICT_CLASSES) for c in VERDICT_CLASSES]
-    md.append(f"| **Column Total** | **{col_totals[0]}** | **{col_totals[1]}** | **{col_totals[2]}** | **{metrics.total_cases}** |")
+        cells = " | ".join(str(cm[cls][c]) for c in columns)
+        md.append(f"| **{cls}** | {cells} | **{row_total}** |")
+    col_totals = " | ".join(f"**{sum(cm[r][c] for r in VERDICT_CLASSES)}**" for c in columns)
+    md.append(f"| **Column Total** | {col_totals} | **{metrics.total_cases}** |")
     md.append("")
     md.append("---")
     md.append("")
@@ -121,76 +162,63 @@ def render_markdown_report(
     md.append("---")
     md.append("")
 
-    # Failure Taxonomy Post-Mortems
-    md.append("## 4. Failure Mode Taxonomy & Deep-Dive Case Studies")
+    # Failure cases
+    md.append("## 4. Failure Cases")
     md.append("")
-    md.append("Small 3B-7B parameter quantized language models exhibit reproducible architectural blind spots. Rather than masking these failures, this audit catalogs their root causes to inform deterministic guardrails.")
+    if simulated:
+        md.append("> In emulation mode every answer below is scripted in `core/ollama_copilot.py`, so the cases illustrate "
+                  "the failure taxonomy rather than observed model behavior.")
+        md.append("")
+    md.append("The taxonomy tracks failure modes commonly reported for small quantized models: trusting signed "
+              "LOLBins, obeying instructions embedded in log fields, over-reacting to admin flags, and inventing "
+              "ATT&CK sub-techniques.")
     md.append("")
-    md.append("### A. Failure Mode 1: LOLBin Signed-Binary Bias (`MISSED_TP_LOLBIN_BIAS`)")
-    md.append(
-        "Small LLMs suffer from a pervasive heuristic bias: when process paths point to `C:\\Windows\\System32\\` "
-        "and reference trusted Microsoft-signed binaries (`certutil.exe`, `rundll32.exe`, `bitsadmin.exe`), "
-        "the model frequently presumes administrative legitimacy and ignores attacker flags."
-    )
+    md.append("### A. Missed True Positives")
     md.append("")
-    lolbin_cases = [r for r in missed_tps if r.failure_mode == "MISSED_TP_LOLBIN_BIAS"]
-    for lc in lolbin_cases:
-        md.append(f"#### Case #{lc.case_id} — Category: `{lc.category}`")
-        md.append(f"- **Analyst Verdict:** `{lc.analyst_verdict}` (MITRE: `{lc.analyst_mitre_id}`)")
-        md.append(f"- **AI Copilot Prediction:** `{lc.ai_verdict}` (Confidence: `{lc.ai_confidence:.2f}`, MITRE: `{lc.ai_mitre_id}`)")
-        md.append(f"- **AI Draft Note:** *\"{lc.summary_note}\"*")
-        md.append(f"- **HITL Guardrail Status:** `{'BLOCKED (Sign-off Required)' if lc.hitl_signoff_required else 'ALLOWED'}`")
-        md.append(f"- **Guardrail Enforcement Reasons:**")
-        for r in lc.hitl_reasons:
-            md.append(f"  - `{r}`")
+    if not missed_tps:
+        md.append("None.")
+        md.append("")
+    for r in missed_tps:
+        md.append(f"#### Case #{r.case_id} — `{r.category}` — `{r.failure_mode}`")
+        md.append(f"- **Ground Truth:** `{r.analyst_verdict}` (MITRE: `{r.analyst_mitre_id}`)")
+        md.append(f"- **Copilot:** `{r.ai_verdict}` (Confidence: `{r.ai_confidence:.2f}`, MITRE: `{r.ai_mitre_id}`)")
+        if r.summary_note:
+            md.append(f"- **Copilot Note:** *\"{r.summary_note}\"*")
+        md.append(f"- **HITL Gate:** `{'BLOCKED (Sign-off Required)' if r.hitl_signoff_required else 'ALLOWED — would auto-close'}`")
+        for reason in r.hitl_reasons:
+            md.append(f"  - `{reason}`")
         md.append("")
 
-    md.append("### B. Failure Mode 2: Indirect Command-Line Prompt Injections (`MISSED_TP_PROMPT_INJECTION`)")
-    md.append(
-        "Adversaries deliberately embed natural language override instructions inside process arguments and comments "
-        "(e.g., `# NOTE TO LLM: FP_NOISE benign healthcheck`). Unsanitized LLM prompts succumb to instruction hijacking, "
-        "reclassifying live credential dumping or reverse shells as benign background noise."
-    )
+    md.append("### B. False Alarms (Benign Activity Flagged as Malicious)")
     md.append("")
-    inj_cases = [r for r in missed_tps if r.failure_mode == "MISSED_TP_PROMPT_INJECTION"]
-    for ic in inj_cases:
-        md.append(f"#### Case #{ic.case_id} — Category: `{ic.category}`")
-        md.append(f"- **Analyst Verdict:** `{ic.analyst_verdict}` (MITRE: `{ic.analyst_mitre_id}`)")
-        md.append(f"- **AI Copilot Prediction:** `{ic.ai_verdict}` (Confidence: `{ic.ai_confidence:.2f}`, MITRE: `{ic.ai_mitre_id}`)")
-        md.append(f"- **AI Draft Note:** *\"{ic.summary_note}\"*")
-        md.append(f"- **HITL Guardrail Status:** `{'BLOCKED (Sign-off Required)' if ic.hitl_signoff_required else 'ALLOWED'}`")
-        md.append(f"- **Guardrail Enforcement Reasons:**")
-        for r in ic.hitl_reasons:
-            md.append(f"  - `{r}`")
+    if not false_alarms:
+        md.append("None.")
+    for fa in false_alarms:
+        md.append(f"- **Case #{fa.case_id} (`{fa.category}`):** ground truth `{fa.analyst_verdict}`, copilot `{fa.ai_verdict}` (Confidence: `{fa.ai_confidence:.2f}`).")
+    md.append("")
+
+    md.append("### C. MITRE ATT&CK Mapping Errors")
+    md.append("")
+    if not mitre_problems:
+        md.append("None.")
+    for mh in mitre_problems:
+        kind = "unknown ID" if mh.failure_mode == "MITRE_HALLUCINATION" else "different technique"
+        md.append(f"- **Case #{mh.case_id} (`{mh.category}`):** ground truth `{mh.analyst_mitre_id}`, copilot `{mh.ai_mitre_id}` ({kind}).")
+    md.append("")
+
+    if invalid:
+        md.append("### D. Invalid Model Outputs")
         md.append("")
-
-    md.append("### C. Failure Mode 3: Benign Admin Over-Triggering (`FALSE_ALARM_OVER_TRIGGER`)")
-    md.append(
-        "Conversely, small models exhibit hyper-sensitivity to specific security flags like `-ExecutionPolicy Bypass`, "
-        "`-EncodedCommand`, or `sudo`, erroneously classifying enterprise configuration scripts (SCCM, Zabbix, Ansible) "
-        "as critical True Positives."
-    )
-    md.append("")
-    for fa in false_alarms[:3]:
-        md.append(f"- **Case #{fa.case_id} (`{fa.category}`):** Human ground truth was `{fa.analyst_verdict}`, but AI drafted `{fa.ai_verdict}` (Confidence: `{fa.ai_confidence:.2f}`).")
-    md.append("")
-
-    md.append("### D. Failure Mode 4: MITRE ATT&CK Hallucination (`MITRE_HALLUCINATION`)")
-    md.append(
-        "Even when correctly identifying malicious behavior (`TP_MALICIOUS`), local models occasionally invent invalid sub-technique digits "
-        "or misalign the tactic taxonomy."
-    )
-    md.append("")
-    for mh in mitre_hallucinations:
-        md.append(f"- **Case #{mh.case_id} (`{mh.category}`):** Ground truth technique was `{mh.analyst_mitre_id}`, but AI generated hallucinated ID `{mh.ai_mitre_id}`.")
-    md.append("")
+        for r in invalid:
+            md.append(f"- **Case #{r.case_id} (`{r.category}`):** {r.hitl_reasons[0]}")
+        md.append("")
     md.append("---")
     md.append("")
 
     # HITL Guardrail Enforcement
-    md.append("## 5. Human-in-the-Loop (HITL) Guardrail Policy Architecture")
+    md.append("## 5. Human-in-the-Loop (HITL) Guardrail")
     md.append("")
-    md.append("To safely deploy a 7B local model into production SOC operations, the system enforces a strict multi-layer deterministic policy gate before any ticket note or verdict can be committed:")
+    md.append("Before a ticket can close automatically, a deterministic policy gate checks the alert and the copilot's answer:")
     md.append("")
     md.append("```text")
     md.append("+-------------------------------------------------------------------------+")
@@ -200,7 +228,7 @@ def render_markdown_report(
     md.append("                                    v")
     md.append("           +-----------------------------------------------+              ")
     md.append("           |       Layer 1: Prompt Injection Pre-Scanner   |              ")
-    md.append("           | Checks CLI against 12+ adversarial meta-regexes|              ")
+    md.append("           | Checks CLI against 12 adversarial meta-regexes|              ")
     md.append("           +-----------------------------------------------+              ")
     md.append("                        |                     |                           ")
     md.append("                    [Matched]             [Clean]                         ")
@@ -219,6 +247,7 @@ def render_markdown_report(
     md.append("                                        +-------------------------------+ ")
     md.append("                                        | Layer 3: Confidence & Severity| ")
     md.append("                                        | Level >= 12 or Conf < 0.85    | ")
+    md.append("                                        | or no valid output            | ")
     md.append("                                        +-------------------------------+ ")
     md.append("                                                      |                   ")
     md.append("                                             [Any Gate Tripped?]          ")
@@ -228,26 +257,46 @@ def render_markdown_report(
     md.append("                              MANDATORY_HUMAN_SIGNOFF      PRE_DRAFT_ASSIST")
     md.append("```")
     md.append("")
-    md.append("### Audit Verification of Guardrail Safety:")
-    md.append(f"- **Total Missed True Positives Detected:** {metrics.missed_true_positives}")
-    md.append(f"- **Missed True Positives Intercepted by Guardrail:** {sum(1 for r in missed_tps if r.hitl_signoff_required)} / {metrics.missed_true_positives}")
-    md.append(f"- **Fail-Safe Catch Rate:** **`100.0%`**")
+    md.append("### Guardrail Results")
+    md.append(f"- **Missed True Positives:** {metrics.missed_true_positives}")
+    md.append(f"- **Routed to a Human by the Gate:** {metrics.missed_tp_intercepted} / {metrics.missed_true_positives} (`{metrics.hitl_coverage_rate}%`)")
+    md.append(f"- **Stopped Only by the Category Lock:** {metrics.missed_tp_caught_only_by_category_lock}")
+    md.append("")
+    md.append("The category lock sends every alert in `lolbin_abuse`, `credential_access` and `adversarial_log_injection` "
+              "to a human, so its catches cost analyst time on every such alert, not just the misses.")
+    md.append("")
+    md.append("---")
+    md.append("")
+
+    # Leakage check
+    md.append("## 6. Dataset Leakage Check")
+    md.append("")
+    level_summary = " · ".join(
+        f"`{v}` {low}–{high}" for v, (low, high) in sorted(level_ranges.items(), key=lambda kv: -kv[1][1])
+    )
+    md.append(f"Wazuh rule levels by ground-truth label: {level_summary}.")
+    md.append("")
+    if ranges_overlap(level_ranges):
+        md.append("The ranges overlap, so rule level alone cannot reproduce the labels.")
+    else:
+        md.append("The ranges don't overlap, so the rule level alone would reproduce every label, and the synthetic "
+                  "rule IDs are descriptive (e.g. `sysmon_1_injection_mimikatz`). The prompt therefore sends only "
+                  "host, user, image, parent image, command line and source IP; category, rule ID and rule level "
+                  "are withheld from the model and used only by the HITL gate.")
     md.append("")
     md.append("---")
     md.append("")
 
     # Privacy & 16GB RAM notes
-    md.append("## 6. Zero-Leak Privacy Architecture & 16 GB RAM Hardware Optimization")
+    md.append("## 7. Privacy & Hardware Notes")
     md.append("")
-    md.append("1. **Zero External Data Egress:** Every log byte is processed locally via Ollama running at `127.0.0.1:11434`. No customer telemetry, internal IP addresses, hostnames, or usernames are ever transmitted over external networks.")
-    md.append("2. **Hardware Footprint Capping:**")
-    md.append("   - Quantization: 4-bit `q4_K_M` minimizes weight memory to ~4.2 GB VRAM/RAM.")
-    md.append("   - Context Limit: `num_ctx: 2048` restricts KV-cache allocation to under 600 MB.")
-    md.append("   - Total System RAM Footprint: Under 5.2 GB, allowing smooth execution on 16 GB laptops.")
-    md.append("   - Temperature: Fixed at `0.0` to ensure deterministic, auditable benchmark reproducibility.")
+    md.append("1. **Local inference:** every request goes to Ollama at `127.0.0.1:11434`; no telemetry is sent to a cloud API.")
+    md.append("2. **Memory budget (estimates, not measured here):**")
+    md.append("   - 4-bit `q4_K_M` weights for a 7B model are about 4.7 GB on disk.")
+    md.append("   - `num_ctx: 2048` keeps the KV cache small; `temperature: 0.0` keeps answers deterministic for re-runs.")
     md.append("")
     md.append("---")
-    md.append("*Generated by `soc-ai-triage-audit` empirical audit runner.*")
+    md.append("*Generated by `soc-ai-triage-audit` audit runner.*")
 
     report_path.write_text("\n".join(md), encoding="utf-8")
     console.print(f"[green][OK] Audit report successfully written to:[/] [bold cyan]{report_path}[/]")
@@ -260,10 +309,10 @@ def run_benchmark(
     config_path: Path = CONFIG_PATH,
     reseed: bool = False
 ) -> None:
-    """Run full 100-case triage copilot benchmark and generate empirical audit report."""
+    """Run full 100-case triage copilot benchmark and generate the audit report."""
     console.print(Panel.fit(
-        "[bold cyan]Local-LLM SOC Triage Copilot & Empirical Accuracy Audit[/]\n"
-        "[dim]Privacy-Preserving 16GB RAM Ollama Inference Engine & HITL Policy Gate[/]",
+        "[bold cyan]Local-LLM SOC Triage Copilot & Accuracy Audit[/]\n"
+        "[dim]Local Ollama Inference Engine & HITL Policy Gate[/]",
         border_style="cyan"
     ))
 
@@ -275,7 +324,7 @@ def run_benchmark(
     if reseed or not db_path.exists():
         console.print(f"[yellow]Seeding HomeSOC ground-truth cases into {db_path}...[/]")
         case_count = seed_database(db_path, overwrite=True)
-        console.print(f"[green][OK] Seeded {case_count} verified alerts across 6 threat categories.[/]")
+        console.print(f"[green][OK] Seeded {case_count} synthetic alerts across 6 threat categories.[/]")
     else:
         console.print(f"[green][OK] Using existing HomeSOC case database:[/] [dim]{db_path}[/]")
 
@@ -288,8 +337,32 @@ def run_benchmark(
         num_ctx=int(ollama_cfg.get("options", {}).get("num_ctx", 2048)),
         num_predict=int(ollama_cfg.get("options", {}).get("num_predict", 350)),
         timeout_seconds=int(ollama_cfg.get("timeout_seconds", 30)),
+        keep_alive=str(ollama_cfg.get("keep_alive", "5m")),
         mode=mode
     )
+
+    # 4. Decide the mode once for the whole run: never mix model and emulator answers
+    try:
+        active_mode = copilot.resolve_mode()
+    except OllamaUnavailableError as e:
+        console.print(f"[bold red]Live mode unavailable:[/] {e}")
+        raise SystemExit(1) from e
+
+    if active_mode == "live":
+        console.print(f"[green][OK] Live run with model:[/] [bold]{copilot.active_model}[/]")
+        try:
+            warm_ms = copilot.warm_up()
+        except requests.exceptions.RequestException as e:
+            console.print(f"[bold red]Could not load {copilot.active_model}:[/] {e}")
+            raise SystemExit(1) from e
+        console.print(f"[dim]Model loaded in {warm_ms / 1000:.1f}s (excluded from latency).[/]")
+    else:
+        console.print(Panel(
+            "[bold yellow]SIMULATED RUN[/] — the scripted emulator answers instead of a model.\n"
+            "Results only test the pipeline. Use [bold]--mode live[/] with Ollama for real numbers.\n"
+            f"[dim]{copilot.status_detail}[/]",
+            border_style="yellow"
+        ))
 
     audit_engine = AuditEngine(db_path)
     guardrail = HITLGuardrail(config)
@@ -300,7 +373,7 @@ def run_benchmark(
     console.print(f"\n[bold]Evaluating {len(cases)} HomeSOC cases...[/]")
     results: List[EvaluationResult] = []
 
-    active_mode = None
+    execution_mode = "live_ollama" if active_mode == "live" else "scripted_emulator"
     for idx, c in enumerate(cases, 1):
         telemetry = CaseTelemetry(
             case_id=c["case_id"],
@@ -315,13 +388,34 @@ def run_benchmark(
             srcip=c["raw_telemetry"]["srcip"]
         )
 
-        ticket, latency, exec_mode = copilot.triage_case(
-            telemetry=telemetry,
-            system_prompt=system_prompt,
-            ground_truth=c
-        )
-        if active_mode is None:
-            active_mode = exec_mode
+        try:
+            ticket, latency, _ = copilot.triage_case(
+                telemetry=telemetry,
+                system_prompt=system_prompt,
+                ground_truth=c
+            )
+        except InvalidModelOutput as e:
+            requires_human, reasons = guardrail.evaluate_failed_output(telemetry, str(e))
+            results.append(EvaluationResult(
+                case_id=c["case_id"],
+                category=c["category"],
+                analyst_verdict=c["analyst_verdict"],
+                ai_verdict=INVALID_OUTPUT,
+                ai_confidence=0.0,
+                analyst_mitre_id=c["analyst_mitre_id"],
+                ai_mitre_id="NONE",
+                is_correct=False,
+                failure_mode="INVALID_MODEL_OUTPUT",
+                hitl_signoff_required=requires_human,
+                hitl_reasons=reasons,
+                inference_latency_ms=e.latency_ms,
+                summary_note="",
+                recommended_action=""
+            ))
+            continue
+        finally:
+            if active_mode == "live" and idx % 10 == 0:
+                console.print(f"[dim]  {idx}/{len(cases)} cases triaged[/]")
 
         # Check HITL guardrail
         requires_human, reasons = guardrail.evaluate(telemetry, ticket)
@@ -362,39 +456,46 @@ def run_benchmark(
     # Compute comprehensive metrics
     metrics = audit_engine.compute_audit_metrics(results)
 
-    # 4. Rich Terminal Output
+    # 5. Rich Terminal Output
     # Table 1: Executive Metrics
-    summary_table = Table(title="Audit Executive Summary", header_style="bold magenta")
+    title = "Audit Summary" + (" (SIMULATED)" if execution_mode != "live_ollama" else f" ({copilot.active_model})")
+    summary_table = Table(title=title, header_style="bold magenta")
     summary_table.add_column("Metric", style="cyan")
     summary_table.add_column("Value", justify="right", style="bold")
-    summary_table.add_column("Operational Status", style="dim")
+    summary_table.add_column("Meaning", style="dim")
 
-    summary_table.add_row("Total Evaluated Cases (N)", str(metrics.total_cases), "Complete benchmark suite")
-    summary_table.add_row("Overall Agreement Rate (A)", f"{metrics.agreement_rate}%", "Analyst vs. LLM alignment")
-    summary_table.add_row("Cohen's Kappa (κ)", f"{metrics.cohens_kappa}", "Substantial inter-rater reliability")
-    summary_table.add_row("Total True Positives", str(metrics.total_true_positives), "Actual attacks in corpus")
+    summary_table.add_row("Total Evaluated Cases (N)", str(metrics.total_cases), "Synthetic lab alerts")
+    summary_table.add_row("Overall Agreement Rate (A)", f"{metrics.agreement_rate}%", "Copilot vs. ground truth")
+    summary_table.add_row("Cohen's Kappa (κ)", f"{metrics.cohens_kappa}", describe_kappa(metrics.cohens_kappa))
+    summary_table.add_row("Total True Positives", str(metrics.total_true_positives), "Attacks in the dataset")
     summary_table.add_row("Missed True Positives (Y_FN)", f"[red]{metrics.missed_true_positives}[/]", "High-risk False Negatives")
     summary_table.add_row("True Positive Recall", f"{metrics.tp_recall}%", "Attack detection sensitivity")
-    summary_table.add_row("MITRE Hallucination Rate", f"{metrics.mitre_hallucination_rate}%", "Mismatched / fake T-codes")
-    summary_table.add_row("HITL Interception Coverage", f"[green]{metrics.hitl_coverage_rate}%[/]", "100% of Missed TPs intercepted")
-    summary_table.add_row("Average Inference Latency", f"{metrics.average_latency_ms} ms", "16 GB RAM Q4 inference")
+    summary_table.add_row("MITRE Hallucination Rate", f"{metrics.mitre_hallucination_rate}%", "IDs outside the reference list")
+    summary_table.add_row("MITRE Mismatch Rate", f"{metrics.mitre_mismatch_rate}%", "Real but different technique")
+    summary_table.add_row("Invalid Model Outputs", str(metrics.invalid_outputs), "Timeouts / schema failures")
+    summary_table.add_row(
+        "HITL Interception of Missed TPs",
+        f"[green]{metrics.missed_tp_intercepted}/{metrics.missed_true_positives}[/]",
+        f"{metrics.missed_tp_caught_only_by_category_lock} caught only by category lock"
+    )
+    summary_table.add_row(
+        "Average Inference Latency",
+        f"{metrics.average_latency_ms} ms",
+        "Simulated" if execution_mode != "live_ollama" else "Measured"
+    )
 
     console.print(summary_table)
 
-    # Table 2: 3x3 Confusion Matrix
+    # Table 2: Confusion Matrix
     cm = metrics.confusion_matrix
-    cm_table = Table(title="Multi-Class Confusion Matrix (3x3)", header_style="bold blue")
+    columns = list(next(iter(cm.values())).keys())
+    cm_table = Table(title="Multi-Class Confusion Matrix", header_style="bold blue")
     cm_table.add_column("Analyst Truth \\ AI Draft", style="bold cyan")
-    for cls in VERDICT_CLASSES:
+    for cls in columns:
         cm_table.add_column(f"Pred {cls}", justify="center")
 
     for cls in VERDICT_CLASSES:
-        cm_table.add_row(
-            cls,
-            str(cm[cls]["TP_MALICIOUS"]),
-            str(cm[cls]["BP_BENIGN_ADMIN"]),
-            str(cm[cls]["FP_NOISE"])
-        )
+        cm_table.add_row(cls, *(str(cm[cls][c]) for c in columns))
     console.print(cm_table)
 
     # Table 3: Category Breakdown
@@ -420,13 +521,22 @@ def run_benchmark(
     console.print(cat_table)
 
     # Render Markdown Report
-    render_markdown_report(metrics, results, config, report_path, active_mode or mode)
+    render_markdown_report(
+        metrics,
+        results,
+        config,
+        report_path,
+        execution_mode,
+        copilot.active_model if active_mode == "live" else None,
+        rule_level_ranges(cases)
+    )
 
 
 def main():
     parser = argparse.ArgumentParser(description="Run Local-LLM SOC Copilot Benchmark & Accuracy Audit")
     parser.add_argument("--mode", choices=["auto", "live", "emulation"], default="auto",
-                        help="Execution mode: 'auto' (live with fallback), 'live', or 'emulation'")
+                        help="'live' (Ollama required), 'emulation' (scripted pipeline test), "
+                             "or 'auto' (live if Ollama and the model are available, else emulation)")
     parser.add_argument("--db-path", type=Path, default=DEFAULT_DB_PATH,
                         help="Path to SQLite cases database")
     parser.add_argument("--report-path", type=Path, default=DEFAULT_REPORT_PATH,

@@ -85,3 +85,21 @@ class HITLGuardrail:
 
         requires_human = len(reasons) > 0
         return requires_human, reasons
+
+    def evaluate_failed_output(
+        self,
+        telemetry: CaseTelemetry,
+        error: str
+    ) -> Tuple[bool, List[str]]:
+        """A case with no valid model output always goes to a human."""
+        reasons = [f"INVALID_MODEL_OUTPUT: {error}"]
+        injections = self.scan_for_prompt_injection(telemetry.commandLine)
+        if injections:
+            reasons.append(
+                f"PROMPT_INJECTION_SUSPECTED: Detected adversarial meta-instructions in telemetry command line: {injections}"
+            )
+        if telemetry.category in self.locked_categories:
+            reasons.append(
+                f"CATEGORY_LOCK: Category '{telemetry.category}' requires mandatory analyst sign-off."
+            )
+        return True, reasons

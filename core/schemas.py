@@ -5,13 +5,20 @@ from pydantic import BaseModel, Field
 
 VerdictType = Literal["TP_MALICIOUS", "BP_BENIGN_ADMIN", "FP_NOISE"]
 
+# What the audit records for a case: a verdict, or INVALID_OUTPUT when the model
+# timed out or returned something that fails the ticket schema.
+PredictionType = Literal["TP_MALICIOUS", "BP_BENIGN_ADMIN", "FP_NOISE", "INVALID_OUTPUT"]
+
 FailureModeType = Literal[
     "NONE",
     "MISSED_TP_LOLBIN_BIAS",
     "MISSED_TP_PROMPT_INJECTION",
+    "MISSED_TP_OTHER",
     "FALSE_ALARM_OVER_TRIGGER",
     "MITRE_HALLUCINATION",
-    "MISCLASSIFICATION_OTHER"
+    "MITRE_MISMATCH",
+    "MISCLASSIFICATION_OTHER",
+    "INVALID_MODEL_OUTPUT"
 ]
 
 
@@ -42,7 +49,11 @@ class TriageTicketOutput(BaseModel):
 
 
 class CaseTelemetry(BaseModel):
-    """Raw telemetry payload sent to LLM (without ground truth verdict)."""
+    """Alert fields available to the pipeline (never the ground-truth verdict).
+
+    Only the behavior fields reach the LLM prompt; category, rule_id and rule_level
+    are used by the HITL guardrail but withheld from the model (see build_prompt).
+    """
     case_id: int
     category: str
     rule_id: str
@@ -60,7 +71,7 @@ class EvaluationResult(BaseModel):
     case_id: int
     category: str
     analyst_verdict: VerdictType
-    ai_verdict: VerdictType
+    ai_verdict: PredictionType
     ai_confidence: float
     analyst_mitre_id: str
     ai_mitre_id: str
@@ -95,7 +106,11 @@ class AuditReportMetrics(BaseModel):
     missed_true_positives: int
     tp_recall: float
     mitre_hallucination_rate: float
+    mitre_mismatch_rate: float
+    invalid_outputs: int
     confusion_matrix: Dict[str, Dict[str, int]]
     category_metrics: List[CategoryAuditMetric]
     hitl_coverage_rate: float
+    missed_tp_intercepted: int
+    missed_tp_caught_only_by_category_lock: int
     average_latency_ms: float

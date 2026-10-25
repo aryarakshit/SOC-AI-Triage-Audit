@@ -43,7 +43,8 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 
-# GSD Staging
-.agents/.gsd-staging/
 
 # Note: data/homesoc_cases.db is committed as reproducible ground-truth benchmark or generated via runner
+
+# Local AI agent tooling (GSD) - not part of the project
+.agents/
