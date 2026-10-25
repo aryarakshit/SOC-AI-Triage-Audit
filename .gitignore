@@ -25,6 +25,7 @@ wheels/
 
 # Testing & Coverage
 .pytest_cache/
+.benchmarks/
 .coverage
 htmlcov/
 
