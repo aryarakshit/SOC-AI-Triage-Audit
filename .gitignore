@@ -50,3 +50,4 @@ Desktop.ini
 # Local AI agent tooling (GSD) - not part of the project
 .agents/
 .planning/
+*blueprint*.md
